@@ -1,0 +1,36 @@
+name: rob831
+channels:
+  - defaults
+dependencies:
+  - pip
+  - python >= 3.10.8
+  - setuptools
+  - termcolor
+  - pip:
+      - black
+      - colorama
+      - commentjson
+      - gymnasium
+      - matplotlib>=3.5.1
+      - mpmath==1.3.0
+      - numpy-stl
+      - numpy>=2.1.1
+      - onshape-to-robot
+      - opencv-python
+      - pre-commit
+      - protobuf<=3.20.0
+      - pybullet
+      - pylint
+      - pytest>=7.4.0
+      - requests
+      - ruamel.yaml
+      - scipy>=1.10.1
+      - sympy==1.13.3
+      - torch
+      - stable_baselines3
+      - shimmy
+      - tensorboard
+      - moviepy
+      - tdqm
+      - rich
+
