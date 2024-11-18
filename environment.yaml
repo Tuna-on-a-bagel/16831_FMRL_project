@@ -11,6 +11,7 @@ dependencies:
       - colorama
       - commentjson
       - gymnasium
+      - mujocopy
       - matplotlib>=3.5.1
       - mpmath==1.3.0
       - numpy-stl
@@ -19,7 +20,6 @@ dependencies:
       - opencv-python
       - pre-commit
       - protobuf<=3.20.0
-      - pybullet
       - pylint
       - pytest>=7.4.0
       - requests
