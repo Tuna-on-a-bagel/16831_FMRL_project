@@ -15,6 +15,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.env_util import make_vec_env
 
+from utils import from_numpy, to_numpy
+
 class Client:
 
     def __init__(self, args, seed, xml_filepath: str = None):
@@ -22,7 +24,7 @@ class Client:
         self.env_time_horizon = args.n_steps_per_env
         self.rng = np.random.default_rng(seed=seed).uniform # callable random generator
 
-        if args.evn_name.lower() == 'ant':
+        if args.env_name.lower() == 'ant':
 
             # generate xml with random parameters 
             client_custom_xml = None # TODO: load the file
@@ -55,7 +57,7 @@ class Client:
             
 
 
-        elif args.evn_name.lower() == 'halfcheetah':
+        elif args.env_name.lower() == 'halfcheetah':
             # generate xml with random parameters 
             client_custom_xml = None # TODO: load the file
 
@@ -83,7 +85,13 @@ class Client:
 
                 raise NotImplementedError
 
-        policy_kwargs = dict(optimizer_class=torch.optim.SGD, optimizer_kwargs=dict(lr=0.001, momentum=0.9))
+        policy_kwargs = dict(
+            optimizer_class=torch.optim.SGD, 
+            # optimizer_kwargs=dict(
+            #       lr=0.001), 
+            #       momentum=0.9)
+                )
+
         self.model = PPO(
                 policy='MlpPolicy',
                 env=self.env,
@@ -100,6 +108,8 @@ class Client:
                 vf_coef=0.5,
                 policy_kwargs=policy_kwargs
                 )
+        
+        self.env.reset()
         
     def get_trajectory(self) -> RolloutBuffer:
 
@@ -137,11 +147,13 @@ class FMRL:
         self.build_client_list(args) # [(env, index), (env, index), ...]
         
         # env with standard model params and objective functions
-        if args.evn_name.lower() == 'ant':
+        if args.env_name.lower() == 'ant':
             self.env = gym.make("Ant-v5")
 
-        elif args.evn_name.lower() == 'halfcheetah':
+        elif args.env_name.lower() == 'halfcheetah':
             self.env = gym.make("HalfCheetah-v5")
+
+        self.env.reset()    # populate first observation
 
         
         self.global_model = PPO(
@@ -163,8 +175,8 @@ class FMRL:
         # from paper
         self.B1 = 0.9
         self.B2 = 0.999
-        self.prev_theta = torch.zeros_like(self.global_model.policy.parameters_to_vector())   
-        self.prev_zed = torch.zeros_like(self.global_model.policy.parameters_to_vector())
+        self.prev_theta = torch.zeros_like(from_numpy(self.global_model.policy.parameters_to_vector()))   
+        self.prev_zed = torch.zeros_like(from_numpy(self.global_model.policy.parameters_to_vector()))
         self._n = 0.001
         self._k = 1e-8
         
@@ -179,9 +191,11 @@ class FMRL:
 
         # main thread
         else:
-            client_seeds = self.uniform_rng(low=0, high=1000)
+            client_seeds = self.uniform_rng(low=0, high=1000, size=int(args.n_client_envs))
+            print(f'client_seeds: {client_seeds}')
+            
             for i in range(args.n_client_envs):
-                self.client_list.append(Client(args=args, seed=client_seeds[i]))
+                self.client_list.append(Client(args=args, seed=int(client_seeds[i])))
 
     def sample_client_list(self) -> list:
         """
@@ -278,7 +292,7 @@ class FMRL:
         """
         Outer loop aggregation rounds
         """
-        for k in self.n_aggregation_rounds:
+        for k in range(self.n_aggregation_rounds):
 
             client_samples: list[Client] = self.sample_client_list()
 
@@ -370,7 +384,7 @@ def add_args():
     
     
     # FRML parameters
-    parser.add_argument('--n_client_envs', type=int, default=200, 
+    parser.add_argument('--n_client_envs', type=int, default=20, 
                                 help='Number of clinets (independent environments)')
     
     parser.add_argument('--client_sample_coeff', type=int, default=0.2, 
@@ -399,6 +413,7 @@ if __name__ == "__main__":
     args = add_args()
 
     fmrl = FMRL(args)
+    print('----- FRML init success -----')
 
     trained_model = fmrl.train()
 

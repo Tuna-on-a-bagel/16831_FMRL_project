@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import torch
 
 def modify_mujoco_params(xml_file_path, mass_dict=None, inertia_dict=None, leg_length_dict=None, output_file_path='modified_model.xml'):
     """
@@ -55,3 +56,11 @@ def modify_mujoco_params(xml_file_path, mass_dict=None, inertia_dict=None, leg_l
 
     # Write the modified XML to a new file
     tree.write(output_file_path)
+
+
+def from_numpy(*args, **kwargs):
+    return torch.from_numpy(*args, **kwargs).float().to('cpu')
+
+
+def to_numpy(tensor):
+    return tensor.to('cpu').detach().numpy()
