@@ -9,11 +9,16 @@ import torch
 import xml.etree.ElementTree as ET
 import gymnasium as gym
 
+from gymnasium import spaces
+
 from multiprocessing import Value, Array
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.utils import obs_as_tensor
+
+from collections import deque
 
 from utils import from_numpy, to_numpy
 
@@ -113,14 +118,113 @@ class Client:
         
     def get_trajectory(self) -> RolloutBuffer:
 
-        self.model.rollout_buffer.reset()
-        self.model.collect_rollouts(env=self.env, 
-                                    callback=None, # TODO
-                                    rollout_buffer=self.model.rollout_buffer, 
-                                    n_rollout_steps=self.env_time_horizon
-                                    )
+        """
+        Run client simulation for args.n_steps_per_env -> i.e. H in pseudo code
+
+        NOTE: 
+            - This is basically SB3's OnPolicyAlgorithm.collect_rollouts(), however SB3 stock
+                implementation is not handling action / obs space dimensions properly with v5 envs.
+            - Only tested with Ant-v5 so far: (Paul, 11/23)
         
+
+        returns
+        -------
+        rollout_buffer: class(RolloutBuffer) containing trajectory data, ready for training steps
+        """
+
+        observation, info = self.env.reset()
+
+        self.model._last_obs = observation.reshape(1, -1)
+
+        self.model._last_episode_starts = np.array([True], dtype=bool)
+        
+        self.model.rollout_buffer.reset()
+
+        call_back = self.model._init_callback(None, progress_bar=False)
+
+        self.model.policy.set_training_mode(False)
+
+        self.model.ep_info_buffer = deque(maxlen=self.model._stats_window_size)
+        self.model.ep_success_buffer = deque(maxlen=self.model._stats_window_size)
+
+        call_back.on_rollout_start()
+
+        infos = []
+
+        # simulate
+        for i in range(args.n_steps_per_env):
+
+            with torch.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self.model._last_obs, self.model.device)
+                actions, values, log_probs = self.model.policy(obs_tensor)
+
+            actions = actions.cpu().numpy()
+
+            # Rescale and perform action
+            clipped_actions = actions
+
+            if isinstance(self.model.action_space, spaces.Box):
+                if self.model.policy.squash_output:
+                    # Unscale the actions to match env bounds
+                    # if they were previously squashed (scaled in [-1, 1])
+                    clipped_actions = self.model.policy.unscale_action(clipped_actions)
+                else:
+                    # Otherwise, clip the actions to avoid out of bound error
+                    # as we are sampling from an unbounded Gaussian distribution
+                    clipped_actions = np.clip(actions, self.model.action_space.low, self.model.action_space.high)
+
+            flat_actions = np.squeeze(clipped_actions)
+            new_obs, rewards, terminated, truncated, info = self.env.step(flat_actions)
+            infos.append(info)
+
+            dones = np.array([terminated, truncated])
+
+            # Give access to local variables
+            call_back.update_locals(locals())
+            if not call_back.on_step():
+                return False
+            
+            infos = [{}] if infos is None else infos
+            self.model._update_info_buffer(infos, dones)
+
+            # Handle timeout by bootstrapping with value function
+            # see GitHub issue #633
+            for idx, done in enumerate(dones):
+                if (
+                    done
+                    and infos[idx].get("terminal_observation") is not None
+                    and infos[idx].get("TimeLimit.truncated", False)
+                ):
+                    terminal_obs = self.model.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    with torch.no_grad():
+                        terminal_value = self.model.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+                    rewards[idx] += self.model.gamma * terminal_value
+
+            # add current step to rollout buffer
+            self.model.rollout_buffer.add(
+                self.model._last_obs,  
+                actions,
+                rewards,
+                self.model._last_episode_starts,
+                values,
+                log_probs,
+            )
+            self.model._last_obs = new_obs.reshape(1, -1)
+            self.model._last_episode_starts = np.array([terminated or truncated], dtype=bool)
+
+        with torch.no_grad():
+            # Compute value for the last timestep
+            values = self.model.policy.predict_values(obs_as_tensor(new_obs.reshape(1, -1), self.model.device))  # type: ignore[arg-type]
+
+        self.model.rollout_buffer.compute_returns_and_advantage(last_values=values, dones=np.array([True], dtype=bool))
+
+        call_back.update_locals(locals())
+
+        call_back.on_rollout_end()
+
         return self.model.rollout_buffer
+
 
 ################################################################################
 class FMRL:
@@ -191,11 +295,11 @@ class FMRL:
 
         # main thread
         else:
-            client_seeds = self.uniform_rng(low=0, high=1000, size=int(args.n_client_envs))
+            client_seeds = self.uniform_rng(low=0, high=1000, size=int(args.n_client_envs)).round().astype(int)
             print(f'client_seeds: {client_seeds}')
             
             for i in range(args.n_client_envs):
-                self.client_list.append(Client(args=args, seed=int(client_seeds[i])))
+                self.client_list.append(Client(args=args, seed=client_seeds[i]))
 
     def sample_client_list(self) -> list:
         """
@@ -205,8 +309,9 @@ class FMRL:
         client_sample_list = []
 
         sample_indices = self.uniform_rng(
-                low=0, high=len(self.client_list), size=self.client_sample_size
-                )
+                low=0, high=len(self.client_list), size=int(self.client_sample_size)
+                ).round().astype(int)
+        print(f'sample_indices: {sample_indices}')
 
         # multi thread
         if args.vectorize_envs:
@@ -295,6 +400,8 @@ class FMRL:
         for k in range(self.n_aggregation_rounds):
 
             client_samples: list[Client] = self.sample_client_list()
+
+            print(f'len(clien_samples): {len(client_samples)}')
 
             self.distribute_global_model(clients=client_samples) # TODO: [3]
 
