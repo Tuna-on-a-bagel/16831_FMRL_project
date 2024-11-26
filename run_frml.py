@@ -92,10 +92,12 @@ class Client:
 
         policy_kwargs = dict(
             optimizer_class=torch.optim.SGD, 
+            log_std_init=-0.5,
             # optimizer_kwargs=dict(
-            #       lr=0.001), 
-            #       momentum=0.9)
-                )
+            #       lr=0.001, 
+            #       momentum=0.9
+            #       )
+            )
 
         self.model = PPO(
                 policy='MlpPolicy',
@@ -157,6 +159,11 @@ class Client:
             with torch.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self.model._last_obs, self.model.device)
+                
+                # Clamp log_std to prevent invalid scale
+                self.model.policy.log_std.data = torch.clamp(self.model.policy.log_std.data, -5, 2)
+
+                # Compute actions, values, and log_probs
                 actions, values, log_probs = self.model.policy(obs_tensor)
 
             actions = actions.cpu().numpy()
@@ -352,22 +359,152 @@ class FMRL:
 
         return trajectory_batch
     
-    def inner_adaption(self, client: Client, rollout: RolloutBuffer) -> None: # TODO
+    def compute_policy_gradient(self, rollout, model):      # TODO: need to verify
+        """
+        Compute the policy gradient as per Equation (11) and (12).
+        Args:
+            rollout (RolloutBuffer): Collected trajectory data for the client.
+            model (PPO): Client's current policy model.
+        
+        Returns:
+            torch.Tensor: The computed policy gradient.
+        """
+        # Extract necessary rollout buffer data
+        obs = rollout.observations
+        actions = rollout.actions
+        advantages = torch.tensor(rollout.advantages, dtype=torch.float32, device=model.device)
+        old_log_probs = torch.tensor(rollout.log_probs, dtype=torch.float32, device=model.device)
+
+        # Compute new log_probs and policy ratio u_theta
+        obs_tensor = obs_as_tensor(obs, model.device)
+        new_log_probs = model.policy.evaluate_actions(obs_tensor, from_numpy(actions))[2]  # Get log_probs
+        policy_ratio = torch.exp((new_log_probs - old_log_probs))
+
+        # Handle clip_range as a callable or a value
+        if callable(model.clip_range):
+            clip_range_value = model.clip_range(0)  # Pass progress or epoch as argument if needed
+        else:
+            clip_range_value = model.clip_range
+
+        # Compute clipped policy ratio
+        clipped_ratio = torch.clamp(policy_ratio, 1 - clip_range_value, 1 + clip_range_value)
+
+        # Compute surrogate objective
+        surrogate_loss = torch.min(policy_ratio * advantages, clipped_ratio * advantages)
+
+        # Compute gradients
+        gradients = torch.autograd.grad(surrogate_loss.mean(), model.policy.parameters(), create_graph=True, allow_unused=True)
+        return gradients
+    
+    def inner_adaption(self, client: Client, rollout: RolloutBuffer) -> None: # TODO: need to verify
         """
         conduct local model updates
         """
-        # alpha = 0.1
+        alpha = 0.1
 
-        raise NotImplementedError
-        return # TODO
+        # Compute policy gradient
+        policy_gradient = self.compute_policy_gradient(rollout, client.model)
+
+        # Update parameters as per Equation (16)
+        with torch.no_grad():
+            for param, grad in zip(client.model.policy.parameters(), policy_gradient):
+                if grad is not None:  # Ensure gradient is valid
+                    param.add_(alpha * grad)
     
-    def local_step(self, client: Client, rollout: RolloutBuffer) -> None: # TODO
+    def compute_stochastic_gradient(self, rollout, model, alpha):   # TODO: need to verify
         """
-        Perform a single gradient step on a client model
+        Compute the stochastic gradient for Fi(theta^t_i) as per Equation (20).
+        Args:
+            rollout (RolloutBuffer): Collected trajectory data for the client.
+            model (PPO): Client's current policy model.
+            alpha (float): Learning rate for inner adaptation.
+        
+        Returns:
+            torch.Tensor: The computed stochastic gradient.
         """
-        # client.model.learn()... or client.model.train()...
-        raise NotImplementedError
-        return  # TODO
+        # Compute first-order policy gradient: ∇J_{Psi_i}(theta)
+        obs = rollout.observations
+        actions = from_numpy(rollout.actions)
+        advantages = from_numpy(rollout.advantages)
+        old_log_probs = from_numpy(rollout.log_probs)
+
+        # Convert observations to tensor
+        obs_tensor = obs_as_tensor(obs, model.device)
+
+        # Compute new log_probs and surrogate loss
+        new_log_probs = model.policy.evaluate_actions(obs_tensor, actions)[2]
+        policy_ratio = torch.exp(new_log_probs - old_log_probs)
+
+        if callable(model.clip_range):
+            clip_range_value = model.clip_range(0)  # Pass progress or epoch as argument if needed
+        else:
+            clip_range_value = model.clip_range
+
+        # Ensure clip_range_value is a tensor
+        clip_range_value = torch.tensor(clip_range_value, dtype=torch.float32, device=model.device)
+
+        clipped_ratio = torch.clamp(policy_ratio, 1 - clip_range_value, 1 + clip_range_value)
+        surrogate_loss = torch.mean(torch.min(policy_ratio * advantages, clipped_ratio * advantages))
+
+        # Compute first-order gradient
+        policy_grad = torch.autograd.grad(surrogate_loss, model.policy.parameters(), create_graph=True, allow_unused=True)
+
+        # Approximate Hessian-vector product: α∇²J_{theta}(theta) * grad
+        hessian_vector_product = []
+        for grad in policy_grad:
+            if grad is not None:
+                hvp = torch.autograd.grad(grad.sum(), model.policy.parameters(), retain_graph=True, allow_unused=True)
+                # Sum all tensors in the tuple
+                hvp = [
+                    h if h is not None else torch.zeros_like(g, device=model.device) 
+                    for g, h in zip(model.policy.parameters(), hvp)
+                    ]
+                hessian_vector_product.append(hvp)
+            else:
+                hessian_vector_product.append([torch.zeros_like(p, device=model.device) for p in model.policy.parameters()])
+
+        # Combine first-order gradient and Hessian-vector product
+        stochastic_gradient = []
+        for grad, hvp in zip(policy_grad, hessian_vector_product):
+            if grad is not None and hvp is not None:
+                # -(I + α∇²J_{theta}(theta)) ∇J_{Psi_i}(theta)
+                combined_grad = []
+                for g, h in zip(grad, hvp):
+                    combined_grad.append(-(g + alpha * h))
+                stochastic_gradient.append(combined_grad)
+            else:
+                stochastic_gradient.append([
+                    torch.zeros_like(p, device=model.device) for p in model.policy.parameters()
+                ])
+
+        return stochastic_gradient
+    
+    def local_step(self, client: Client, rollout: RolloutBuffer) -> None: # TODO: need to verify
+        """
+        Perform a local step for the client, updating its model based on Equation (21).
+        Args:
+            client (Client): The client whose model will be updated.
+            rollout (RolloutBuffer): Collected trajectory data for the client.
+        """
+        beta = 0.001  # Learning rate for the local model
+        alpha = 0.1   # Inner adaptation learning rate
+
+        # Compute the stochastic gradient
+        stochastic_gradient = self.compute_stochastic_gradient(rollout, client.model, alpha)
+
+        # Flatten gradients if nested
+        flattened_gradient = []
+        for grad in stochastic_gradient:
+            if isinstance(grad, list):  # Handle nested list
+                flattened_gradient.extend(grad)
+            else:
+                flattened_gradient.append(grad)
+
+        # Update local model parameters as per Equation (21)
+        with torch.no_grad():
+            for param, grad in zip(client.model.policy.parameters(), flattened_gradient):
+                if grad is not None:  # Ensure gradient is valid
+                    param.add_(-beta * grad)
     
     def compute_model_delta(self, model_difference_list: list):
 
@@ -413,13 +550,14 @@ class FMRL:
 
                 rollout_buffer_theta = client.get_trajectory()   
 
-                self.inner_adaption(client=client, rollout=rollout_buffer_theta) # TODO
+                self.inner_adaption(client=client, rollout=rollout_buffer_theta) # TODO: need to verify
 
                 rollout_buffer_psi = client.get_trajectory()    
 
-                for t in self.n_local_steps: # [9-12]
+                for t in range(self.n_local_steps): # [9-12]
                     
-                    self.local_step(client=client, rollout=rollout_buffer_psi) 
+                    self.local_step(client=client, rollout=rollout_buffer_psi)  #　Compute the stochastic gradient based on Eq. (20); TODO: need to verify
+
 
                     # TODO: [11] update model using eq. (21)
 
